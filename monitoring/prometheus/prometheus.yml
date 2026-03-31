@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+scrape_configs:
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_network_.*|container_fs_.*"
+        action: keep
+  # claude-proxy /metrics requires prometheus-fastapi-instrumentator (future work)
+  # - job_name: claude-proxy
+  #   static_configs: [{targets: ["172.17.0.2:8082"]}]
+  #   metrics_path: /metrics

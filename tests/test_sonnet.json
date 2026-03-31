@@ -1,0 +1,23 @@
+{
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 256,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use the execute_command tool to run 'echo hello world'"
+    }
+  ],
+  "tools": [
+    {
+      "name": "execute_command",
+      "description": "Execute a shell command",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string" }
+        },
+        "required": ["command"]
+      }
+    }
+  ]
+}

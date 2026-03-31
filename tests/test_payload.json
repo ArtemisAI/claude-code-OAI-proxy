@@ -1,0 +1,46 @@
+{
+  "model": "claude-opus-4-6",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a python function called usd_to_eur that converts USD to EUR using a rate of 0.92. Then use the write_file tool to save it to /tmp/converter.py. After that, use execute_command to run 'python3 /tmp/converter.py' to verify it works."
+    }
+  ],
+  "tools": [
+    {
+      "name": "write_file",
+      "description": "Write content to a file on disk",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "File path to write to" },
+          "content": { "type": "string", "description": "Content to write" }
+        },
+        "required": ["path", "content"]
+      }
+    },
+    {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "File path to read" }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "execute_command",
+      "description": "Execute a shell command and return output",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "Shell command to execute" }
+        },
+        "required": ["command"]
+      }
+    }
+  ]
+}

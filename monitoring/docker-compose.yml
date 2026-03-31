@@ -1,0 +1,69 @@
+version: "3.8"
+networks:
+  monitoring:
+    driver: bridge
+volumes:
+  prometheus_data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /home/agent/monitoring/data/prometheus }
+  loki_data:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /home/agent/monitoring/data/loki }
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    restart: unless-stopped
+    mem_limit: 100m
+    memswap_limit: 100m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=512MB
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ["9090:9090"]
+    networks: [monitoring]
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports: ["8080:8080"]
+    networks: [monitoring]
+    devices: [/dev/kmsg]
+  loki:
+    image: grafana/loki:2.9.10
+    container_name: loki
+    restart: unless-stopped
+    mem_limit: 80m
+    memswap_limit: 80m
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    ports: ["3100:3100"]
+    networks: [monitoring]
+  promtail:
+    image: grafana/promtail:2.9.10
+    container_name: promtail
+    restart: unless-stopped
+    mem_limit: 32m
+    memswap_limit: 32m
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+    networks: [monitoring]
+    depends_on: [loki]
