@@ -9,7 +9,8 @@ scrape_configs:
       - source_labels: [__name__]
         regex: "container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_network_.*|container_fs_.*"
         action: keep
-  # claude-proxy /metrics requires prometheus-fastapi-instrumentator (future work)
-  # - job_name: claude-proxy
-  #   static_configs: [{targets: ["172.17.0.2:8082"]}]
-  #   metrics_path: /metrics
+  - job_name: claude-proxy
+    static_configs:
+      - targets: ["host.docker.internal:8082"]  # adjust to your Docker host gateway IP
+    metrics_path: /metrics
+    scrape_interval: 15s

@@ -15,6 +15,7 @@ import re
 from datetime import datetime
 import sys
 import tiktoken
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # Load environment variables from .env file
 load_dotenv()
@@ -215,6 +216,9 @@ async def _sync_completion(litellm_request: dict) -> _Namespace:
 # ---------------------------------------------------------------------------
 
 app = FastAPI()
+
+# Prometheus metrics at /metrics
+Instrumentator().instrument(app).expose(app)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2492,7 +2496,13 @@ async def create_message(
                 )
                 total_needed = input_tokens + max_completion
 
-                if total_needed > context_limit:
+                # Safety margin: tiktoken counts can underestimate vs the
+                # backend's native tokenizer.  A 256-token buffer prevents
+                # edge-case overflows (e.g. off-by-3 tokens).
+                CONTEXT_SAFETY_MARGIN = 256
+                effective_limit = context_limit - CONTEXT_SAFETY_MARGIN
+
+                if total_needed > effective_limit:
                     # --- Server-Side Context Pruning (Solution Matrix 3) ---
                     # Preserve: first message (system-injected context) +
                     #           last KEEP_RECENT_TURNS user/assistant pairs.
@@ -2519,9 +2529,9 @@ async def create_message(
                         )
 
                         # Re-check after pruning
-                        if pruned_tokens + max_completion > context_limit:
+                        if pruned_tokens + max_completion > effective_limit:
                             # Pruning wasn't enough — also cap max_completion_tokens
-                            headroom = context_limit - pruned_tokens
+                            headroom = effective_limit - pruned_tokens
                             if headroom > 512:
                                 litellm_request['max_completion_tokens'] = headroom
                                 logger.warning(
@@ -2533,7 +2543,7 @@ async def create_message(
                                 logger.warning(
                                     f"⚠️ Context overflow even after pruning: "
                                     f"{pruned_tokens} input + {max_completion} output "
-                                    f"still exceeds {context_limit}"
+                                    f"still exceeds {effective_limit} (limit {context_limit} - {CONTEXT_SAFETY_MARGIN} margin)"
                                 )
                                 return JSONResponse(
                                     status_code=400,
@@ -2553,7 +2563,7 @@ async def create_message(
                         # Too few messages to prune — return Anthropic error
                         logger.warning(
                             f"⚠️ Context overflow ({input_tokens} + {max_completion} = "
-                            f"{total_needed} > {context_limit}) but only "
+                            f"{total_needed} > {effective_limit}) but only "
                             f"{original_count} messages — cannot prune"
                         )
                         return JSONResponse(
