@@ -27,17 +27,22 @@ wheels/
 venv/
 env/
 ENV/
-.venv/
 
 # Logs
 *.log
 
-# IDE
+# IDE specific files
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# Project specific
+*.png
+.agents/
+.scripts/
+.tests/
+uv.lock
+mcp.json
+CONNECTION_GUIDE.md
+open_gh_issues.py

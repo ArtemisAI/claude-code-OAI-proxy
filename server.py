@@ -8,13 +8,13 @@ from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
 from fastapi.responses import JSONResponse, StreamingResponse
-import litellm
 import uuid
 import time
 from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+import tiktoken
 
 # Load environment variables from .env file
 load_dotenv()
@@ -25,6 +25,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Stream lifecycle + request logs at INFO level
 
 # Configure uvicorn to be quieter
 import uvicorn
@@ -77,6 +78,141 @@ class ColorizedFormatter(logging.Formatter):
 for handler in logger.handlers:
     if isinstance(handler, logging.StreamHandler):
         handler.setFormatter(ColorizedFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# ---------------------------------------------------------------------------
+# Direct httpx backend (replaces litellm.acompletion / litellm.completion)
+# ---------------------------------------------------------------------------
+
+# Shared async HTTP client for backend calls (connection pooling, keepalive)
+_http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    follow_redirects=True,
+)
+
+
+class _Namespace:
+    """Lightweight attribute-access wrapper for dicts (replaces litellm response objects)."""
+    def __init__(self, d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                setattr(self, k, _Namespace(v))
+            elif isinstance(v, list):
+                setattr(self, k, [_Namespace(i) if isinstance(i, dict) else i for i in v])
+            else:
+                setattr(self, k, v)
+    def __repr__(self):
+        return f"_Namespace({self.__dict__})"
+
+
+def _resolve_backend(litellm_request: dict) -> tuple[str, dict, str]:
+    """Extract base_url, headers, and clean model name from litellm_request dict."""
+    model = litellm_request["model"]
+    api_key = litellm_request.get("api_key", "")
+    api_base = litellm_request.get("api_base", "")
+
+    # Strip provider prefix from model name
+    clean_model = model
+    for prefix in ("openai/", "gemini/", "anthropic/"):
+        if clean_model.startswith(prefix):
+            clean_model = clean_model[len(prefix):]
+            break
+
+    # Determine base URL
+    if api_base:
+        base_url = api_base.rstrip("/")
+    elif model.startswith("openai/"):
+        base_url = "https://api.openai.com/v1"
+    elif model.startswith("gemini/"):
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    else:
+        base_url = "https://api.anthropic.com/v1"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    return base_url, headers, clean_model
+
+
+def _build_openai_body(litellm_request: dict, clean_model: str) -> dict:
+    """Build OpenAI chat completions request body from litellm_request dict."""
+    body: dict[str, Any] = {
+        "model": clean_model,
+        "messages": litellm_request["messages"],
+        "stream": litellm_request.get("stream", False),
+    }
+
+    # Optional fields
+    if litellm_request.get("max_completion_tokens"):
+        body["max_completion_tokens"] = litellm_request["max_completion_tokens"]
+    if litellm_request.get("temperature") is not None:
+        body["temperature"] = litellm_request["temperature"]
+    if litellm_request.get("tools"):
+        body["tools"] = litellm_request["tools"]
+    if litellm_request.get("tool_choice"):
+        body["tool_choice"] = litellm_request["tool_choice"]
+    if litellm_request.get("stop"):
+        body["stop"] = litellm_request["stop"]
+    if litellm_request.get("top_p"):
+        body["top_p"] = litellm_request["top_p"]
+
+    # Request usage in streaming responses
+    if body["stream"]:
+        body["stream_options"] = {"include_usage": True}
+
+    return body
+
+
+async def _stream_completion(litellm_request: dict):
+    """Stream chat completions from backend via httpx SSE."""
+    base_url, headers, clean_model = _resolve_backend(litellm_request)
+    body = _build_openai_body(litellm_request, clean_model)
+    url = f"{base_url}/chat/completions"
+
+    request_id = uuid.uuid4().hex[:8]
+    logger.info(f"Stream start [{request_id}]: {clean_model} -> {base_url}")
+    chunk_count = 0
+
+    async with _http_client.stream("POST", url, json=body, headers=headers) as response:
+        if response.status_code != 200:
+            error_body = await response.aread()
+            raise Exception(f"Backend returned {response.status_code}: {error_body.decode()}")
+
+        async for line in response.aiter_lines():
+            if not line.strip():
+                continue
+            if line.startswith("data: "):
+                data = line[6:]
+                if data.strip() == "[DONE]":
+                    logger.info(f"Stream done [{request_id}]: {chunk_count} chunks")
+                    break
+                try:
+                    chunk_json = json.loads(data)
+                    chunk_count += 1
+                    yield _Namespace(chunk_json)
+                except json.JSONDecodeError:
+                    logger.warning(f"Unparseable SSE chunk [{request_id}]: {data[:200]}")
+                    continue
+
+    logger.debug(f"Stream closed [{request_id}]")
+
+
+async def _sync_completion(litellm_request: dict) -> _Namespace:
+    """Non-streaming chat completion via httpx."""
+    base_url, headers, clean_model = _resolve_backend(litellm_request)
+    body = _build_openai_body(litellm_request, clean_model)
+    url = f"{base_url}/chat/completions"
+
+    response = await _http_client.post(url, json=body, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"Backend returned {response.status_code}: {response.text}")
+
+    return _Namespace(response.json())
+
+
+# ---------------------------------------------------------------------------
 
 app = FastAPI()
 
@@ -154,6 +290,162 @@ GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-pro"
 ]
+
+# Default context window limits for backend models (in tokens)
+# These are used to pre-validate requests before sending to the backend
+# Override with MODEL_CONTEXT_LIMIT env var for custom backends
+MODEL_CONTEXT_LIMITS = {
+    # OpenAI models
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4.5-preview": 128000,
+    "o3-mini": 200000,
+    "o1": 200000,
+    "o1-mini": 128000,
+    "o1-pro": 200000,
+    "chatgpt-4o-latest": 128000,
+    # Gemini models
+    "gemini-2.5-flash": 1048576,
+    "gemini-2.5-pro": 1048576,
+    # GLM models (ZhiPu)
+    "glm-5:cloud": 128000,
+    "glm-4.7:cloud": 128000,
+    "glm-4-plus": 128000,
+    "glm-4-long": 1000000,
+}
+
+# Context windows that Claude Code assumes for each Anthropic model.
+# Used to compute the Dynamic Token Scaling factor so that
+# auto-compaction triggers at the correct proportional threshold.
+CLIENT_ASSUMED_LIMITS = {
+    "claude-opus-4-6": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-sonnet-4-5-20250514": 200000,
+    "claude-3-5-sonnet-20241022": 200000,
+    "claude-3-5-sonnet-20240620": 200000,
+    "claude-3-opus-20240229": 200000,
+    "claude-haiku-4-5-20251001": 200000,
+    "claude-3-haiku-20240307": 200000,
+}
+# Default assumed limit if the original model isn't in the map
+_DEFAULT_CLIENT_ASSUMED_LIMIT = 200000
+
+# Allow override via environment variable (for custom/unlisted models)
+_custom_context_limit = os.environ.get("MODEL_CONTEXT_LIMIT")
+if _custom_context_limit:
+    _custom_context_limit = int(_custom_context_limit)
+
+# Token counting via tiktoken (replaces litellm.token_counter)
+_tiktoken_cache = {}
+
+def count_message_tokens(messages: list, model: str = "") -> int:
+    """
+    Count tokens in a list of OpenAI-format messages using tiktoken.
+
+    Uses cl100k_base encoding (works for GPT-4, GPT-3.5, and is a reasonable
+    approximation for other OpenAI-compatible models like GLM-5, DeepSeek, etc.)
+
+    Token counting follows OpenAI's formula:
+    - Every message adds ~4 tokens of overhead (role, separators)
+    - Every reply is primed with ~3 tokens
+    """
+    # Use cl100k_base as default — it's the standard for modern models
+    enc_name = "cl100k_base"
+
+    if enc_name not in _tiktoken_cache:
+        _tiktoken_cache[enc_name] = tiktoken.get_encoding(enc_name)
+    enc = _tiktoken_cache[enc_name]
+
+    tokens_per_message = 4  # <role>, content, separators
+    tokens_per_reply = 3    # assistant priming
+
+    total = 0
+    for msg in messages:
+        total += tokens_per_message
+
+        # Handle role
+        role = msg.get("role", "")
+        total += len(enc.encode(role))
+
+        # Handle content (can be string or list of content blocks)
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += len(enc.encode(content))
+        elif isinstance(content, list):
+            # Content blocks (e.g., [{"type": "text", "text": "..."}])
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if text:
+                        total += len(enc.encode(str(text)))
+                elif isinstance(block, str):
+                    total += len(enc.encode(block))
+        elif content is not None:
+            total += len(enc.encode(str(content)))
+
+        # Handle tool calls in the message
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args = func.get("arguments", "")
+                    total += len(enc.encode(name)) + len(enc.encode(args))
+
+        # Handle name field
+        name = msg.get("name", "")
+        if name:
+            total += len(enc.encode(name))
+
+    total += tokens_per_reply
+    return total
+
+def get_model_context_limit(model: str) -> Optional[int]:
+    """Get the context window limit for a model. Returns None if unknown."""
+    # Strip provider prefix
+    clean = model
+    for prefix in ("openai/", "gemini/", "anthropic/"):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+
+    # Check env override first
+    if _custom_context_limit:
+        return _custom_context_limit
+
+    return MODEL_CONTEXT_LIMITS.get(clean)
+
+def get_client_assumed_limit(original_model: str) -> int:
+    """Get the context window that Claude Code assumes for the original model name."""
+    clean = original_model
+    for prefix in ("anthropic/",):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    return CLIENT_ASSUMED_LIMITS.get(clean, _DEFAULT_CLIENT_ASSUMED_LIMIT)
+
+def compute_token_scaling_factor(original_model: str, backend_model: str) -> float:
+    """
+    Compute the Dynamic Token Scaling factor S = T_client / T_backend.
+
+    When the proxy reports T_reported = T_true * S, Claude Code's
+    95 % auto-compaction threshold maps exactly to 95 % of the
+    backend's real context window, preventing the compaction deadlock.
+
+    Returns 1.0 when no scaling is needed (backend >= client assumption).
+    """
+    backend_limit = get_model_context_limit(backend_model)
+    if backend_limit is None:
+        return 1.0  # Unknown model — pass through unchanged
+
+    client_limit = get_client_assumed_limit(original_model)
+    if backend_limit >= client_limit:
+        return 1.0  # Backend is at least as large — no inflation needed
+
+    return client_limit / backend_limit
 
 # Helper function to clean schema for stricter providers (OpenAI, Gemini, vLLM)
 def clean_tool_schema(schema: Any) -> Any:
@@ -2183,7 +2475,104 @@ async def create_message(
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
-        
+
+        # --- Context overflow prevention (Solution Matrices 1 + 3) ---
+        # Dynamic Token Scaling should normally prevent us from reaching
+        # this point.  If we do, attempt Server-Side Context Pruning
+        # before falling back to an Anthropic-formatted error.
+        backend_model = litellm_request.get('model', '')
+        context_limit = get_model_context_limit(backend_model)
+        if context_limit:
+            try:
+                max_completion = litellm_request.get('max_completion_tokens', 0)
+
+                input_tokens = count_message_tokens(
+                    messages=litellm_request['messages'],
+                    model=backend_model,
+                )
+                total_needed = input_tokens + max_completion
+
+                if total_needed > context_limit:
+                    # --- Server-Side Context Pruning (Solution Matrix 3) ---
+                    # Preserve: first message (system-injected context) +
+                    #           last KEEP_RECENT_TURNS user/assistant pairs.
+                    # Drop: everything in between (verbose tool outputs, old
+                    #        reasoning traces).  This is ephemeral — the
+                    #        client's local .jsonl history is untouched.
+                    KEEP_RECENT_TURNS = 6  # last 6 messages (≈ 3 turn pairs)
+                    messages = litellm_request['messages']
+                    original_count = len(messages)
+
+                    if original_count > KEEP_RECENT_TURNS + 1:
+                        pruned = [messages[0]] + messages[-KEEP_RECENT_TURNS:]
+                        litellm_request['messages'] = pruned
+
+                        pruned_tokens = count_message_tokens(
+                            messages=pruned,
+                            model=backend_model,
+                        )
+
+                        logger.warning(
+                            f"✂️ Context pruning: {input_tokens} → {pruned_tokens} tokens "
+                            f"(dropped {original_count - len(pruned)} mid-conversation messages, "
+                            f"kept first + last {KEEP_RECENT_TURNS})"
+                        )
+
+                        # Re-check after pruning
+                        if pruned_tokens + max_completion > context_limit:
+                            # Pruning wasn't enough — also cap max_completion_tokens
+                            headroom = context_limit - pruned_tokens
+                            if headroom > 512:
+                                litellm_request['max_completion_tokens'] = headroom
+                                logger.warning(
+                                    f"✂️ Throttled max_completion_tokens: "
+                                    f"{max_completion} → {headroom}"
+                                )
+                            else:
+                                # Absolutely no room — return Anthropic error
+                                logger.warning(
+                                    f"⚠️ Context overflow even after pruning: "
+                                    f"{pruned_tokens} input + {max_completion} output "
+                                    f"still exceeds {context_limit}"
+                                )
+                                return JSONResponse(
+                                    status_code=400,
+                                    content={
+                                        "type": "error",
+                                        "error": {
+                                            "type": "invalid_request_error",
+                                            "message": (
+                                                f"prompt is too long: {pruned_tokens} tokens > "
+                                                f"{context_limit - max_completion} maximum context "
+                                                f"tokens for {backend_model}"
+                                            ),
+                                        },
+                                    },
+                                )
+                    else:
+                        # Too few messages to prune — return Anthropic error
+                        logger.warning(
+                            f"⚠️ Context overflow ({input_tokens} + {max_completion} = "
+                            f"{total_needed} > {context_limit}) but only "
+                            f"{original_count} messages — cannot prune"
+                        )
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "type": "error",
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "message": (
+                                        f"prompt is too long: {input_tokens} tokens > "
+                                        f"{context_limit - max_completion} maximum context "
+                                        f"tokens for {backend_model}"
+                                    ),
+                                },
+                            },
+                        )
+            except Exception as tok_err:
+                logger.debug(f"Could not pre-validate context length: {tok_err}")
+
         # Handle streaming mode
         if request.stream:
             # Use LiteLLM for streaming
@@ -2198,8 +2587,8 @@ async def create_message(
                 num_tools,
                 200  # Assuming success at this point
             )
-            # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
+            # Stream via direct httpx SSE
+            response_generator = _stream_completion(litellm_request)
             
             return StreamingResponse(
                 handle_streaming(response_generator, request, raw_request),
@@ -2219,7 +2608,7 @@ async def create_message(
                 200  # Assuming success at this point
             )
             start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
+            litellm_response = await _sync_completion(litellm_request)
             logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
             
             # Convert LiteLLM response to Anthropic format
@@ -2270,17 +2659,55 @@ async def create_message(
         # Log all error details with safe serialization
         sanitized_details = sanitize_for_json(error_details)
         logger.error(f"Error processing request: {json.dumps(sanitized_details, indent=2)}")
-        
-        # Format error for response
-        error_message = f"Error: {str(e)}"
-        if 'message' in error_details and error_details['message']:
-            error_message += f"\nMessage: {error_details['message']}"
-        if 'response' in error_details and error_details['response']:
-            error_message += f"\nResponse: {error_details['response']}"
-        
-        # Return detailed error
+
+        # Determine status code and error message
         status_code = error_details.get('status_code', 500)
-        raise HTTPException(status_code=status_code, detail=error_message)
+        error_message = str(e)
+
+        # Check if this is a context length / prompt too long error
+        error_str = error_message.lower()
+        is_context_overflow = any(phrase in error_str for phrase in [
+            "prompt too long",
+            "context length",
+            "maximum context",
+            "token limit",
+            "too many tokens",
+            "input too long",
+        ])
+
+        if is_context_overflow:
+            # Return Anthropic-formatted error that Claude Code understands
+            logger.warning(f"⚠️ Context overflow from backend — returning Anthropic-formatted error")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"prompt is too long: {error_message}",
+                    },
+                },
+            )
+
+        # For other errors, also return Anthropic-formatted error
+        anthropic_error_type = "api_error"
+        if status_code == 400:
+            anthropic_error_type = "invalid_request_error"
+        elif status_code == 429:
+            anthropic_error_type = "rate_limit_error"
+        elif status_code == 401:
+            anthropic_error_type = "authentication_error"
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "type": "error",
+                "error": {
+                    "type": anthropic_error_type,
+                    "message": error_message,
+                },
+            },
+        )
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(
@@ -2288,8 +2715,16 @@ async def count_tokens(
     raw_request: Request
 ):
     try:
-        # Log the incoming token count request
-        original_model = request.original_model or request.model
+        # Extract the original model name from the raw request body
+        # before Pydantic's field_validator mapped it to the backend model.
+        # (Pydantic v2 field_validator cannot reliably set sibling fields
+        #  via info.data, so request.original_model is always None.)
+        try:
+            raw_body = await raw_request.body()
+            body_json = json.loads(raw_body.decode('utf-8'))
+            original_model = body_json.get("model", request.model)
+        except Exception:
+            original_model = request.model
         
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
@@ -2316,40 +2751,45 @@ async def count_tokens(
             )
         )
         
-        # Use LiteLLM's token_counter function
-        try:
-            # Import token_counter function
-            from litellm import token_counter
-            
-            # Log the request beautifully
-            num_tools = len(request.tools) if request.tools else 0
-            
-            log_request_beautifully(
-                "POST",
-                raw_request.url.path,
-                display_model,
-                converted_request.get('model'),
-                len(converted_request['messages']),
-                num_tools,
-                200  # Assuming success at this point
+        # Count tokens using tiktoken
+        # Log the request beautifully
+        num_tools = len(request.tools) if request.tools else 0
+
+        log_request_beautifully(
+            "POST",
+            raw_request.url.path,
+            display_model,
+            converted_request.get('model'),
+            len(converted_request['messages']),
+            num_tools,
+            200  # Assuming success at this point
+        )
+
+        # Count tokens
+        token_count = count_message_tokens(
+            messages=converted_request["messages"],
+            model=converted_request.get("model", ""),
+        )
+
+        # --- Dynamic Token Scaling (Solution Matrix 1) ---
+        # Inflate the reported count so Claude Code's auto-compaction
+        # threshold (default 95 % of assumed window) maps correctly
+        # to the backend model's real context limit.
+        scaling_factor = compute_token_scaling_factor(
+            original_model, converted_request["model"]
+        )
+        if scaling_factor > 1.0:
+            raw_count = token_count
+            token_count = int(token_count * scaling_factor)
+            logger.debug(
+                f"📐 Token scaling: {raw_count} true × {scaling_factor:.4f} "
+                f"= {token_count} reported  "
+                f"(client assumes {get_client_assumed_limit(original_model)}, "
+                f"backend limit {get_model_context_limit(converted_request['model'])})"
             )
-            
-            # Prepare token counter arguments
-            token_counter_args = {
-                "model": converted_request["model"],
-                "messages": converted_request["messages"],
-            }
-            
-            # Count tokens
-            token_count = token_counter(**token_counter_args)
-            
-            # Return Anthropic-style response
-            return TokenCountResponse(input_tokens=token_count)
-            
-        except ImportError:
-            logger.error("Could not import token_counter from litellm")
-            # Fallback to a simple approximation
-            return TokenCountResponse(input_tokens=1000)  # Default fallback
+
+        # Return Anthropic-style response
+        return TokenCountResponse(input_tokens=token_count)
             
     except Exception as e:
         import traceback
